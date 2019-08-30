@@ -722,20 +722,23 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 		// get one buf from pool
 		buf := d.BufferPoolGet()
 		defer d.BufferPoolPut(buf)
-		if d.nextReadPos == d.readPos {
-			// start to peek next data, if it isn't stop, we have to find a stop signal
-			dataRead, err = d.peekOne(nil, nil, buf, lastStopReadFileNum, lastStopReadPos)
-			if err != nil {
-				return err
-			}
-		}
-		// continue to seek
-		if len(dataRead) == 0 {
-			return err
-		}
+		// if d.nextReadPos == d.readPos {
+		// 	// start to peek next data, if it isn't stop, we have to find a stop signal
+		// 	dataRead, err = d.peekOne(nil, nil, buf, lastStopReadFileNum, lastStopReadPos)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// }
+
+		// set to 0 to pretend we have to stop forward
+		pretendStopForward := -1
+		// if len(dataRead) == 0 {
+		// 	return err
+		// }
 		for {
 			// stop forward
-			if len(dataRead) == 0 || f(dataRead) == 0 {
+			if pretendStopForward == 0 || f(dataRead) == 0 { // len(dataRead) == 0
+				pretendStopForward = -1
 				endWriteFileNum, endWritePos = currReadFileNum, currReadPos
 				lastStopReadFileNum, lastStopReadPos = currReadFileNum, currReadPos
 				// do we have data to backward half?
@@ -759,16 +762,14 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 						// search first message
 						dataRead, err = d.peekOne(nil, nil, buf, currReadFileNum, currReadPos)
 						if err != nil {
-							break
+							return err
 						}
 					}
-				} else if beginReadFileNum == currReadFileNum {
-					// this is the end
+				} else if beginReadFileNum == currReadFileNum { // this is the end
 					break
-				} else {
-					// this is the end
-					break
-				}
+				} // else { // this is the end
+				//	break
+				//}
 			} else {
 				// continue forward
 				beginReadFileNum, beginReadPos = currReadFileNum, currReadPos
@@ -783,8 +784,9 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 						// treat this as backward signal
 						if currReadFileNum == d.writeFileNum && d.writePos == 0 {
 							err = nil
+							pretendStopForward = 0
 						} else {
-							break
+							return err
 						}
 					}
 				} else if currReadFileNum == endWriteFileNum {
@@ -799,32 +801,32 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 						lastStopReadPos = tempLastStopReadPos
 						// }
 						break
-					} else {
-						// this is the end
-						break
-					}
-				} else {
-					// this is the end
-					break
-				}
+					} // else { // this is the end
+					//	break
+					//}
+				} // else { // this is the end
+				//	break
+				//}
 			}
 		}
 		// eventually we need to set readFileNum and readPos to a new position.
 		if d.readFileNum != lastStopReadFileNum || d.readPos != lastStopReadPos {
 			// reclaim oldDataRead
 			d.BufferPoolPut(oldDataRead)
-			if d.readFileNum != lastStopReadFileNum {
-				// remove all file from d.readFileNum to lastStopReadFileNum
-				if d.readFile != nil {
-					d.readFile.Close()
-					d.readFile = nil
-				}
-
-				d.removeFiles(d.readFileNum, lastStopReadFileNum)
-				// recalculate the depth
-				depth := d.depthInFiles(lastStopReadFileNum, lastStopReadPos, d.writeFileNum, d.writePos)
-				atomic.StoreInt64(&d.depth, depth)
+			// remove all file from d.readFileNum to lastStopReadFileNum
+			// close anyway, let the ioLoop reOpen the file and seek to correct position
+			if d.readFile != nil {
+				d.readFile.Close()
+				d.readFile = nil
 			}
+			if d.readFileNum != lastStopReadFileNum {
+				d.removeFiles(d.readFileNum, lastStopReadFileNum)
+			}
+			// recalculate the depth
+			depth := d.depthInFiles(lastStopReadFileNum, lastStopReadPos, d.writeFileNum, d.writePos)
+			// d.logf(INFO, "depthInFiles(%d): lastStopReadFileNum=%d, lastStopReadPos=%d, d.writeFileNum=%d, d.writePos=%d", depth, lastStopReadFileNum, lastStopReadPos, d.writeFileNum, d.writePos)
+			atomic.StoreInt64(&d.depth, depth)
+
 			d.readFileNum, d.readPos = lastStopReadFileNum, lastStopReadPos
 			d.nextReadFileNum, d.nextReadPos = d.readFileNum, d.readPos
 			d.sync()
@@ -853,10 +855,15 @@ func (d *diskQueue) removeFiles(readFileNum, endFileNum int64) (err error) {
 func (d *diskQueue) depthInFiles(readFileNum, readPos, endFileNum, endReadPos int64) (depth int64) {
 	for i := readFileNum; i <= endFileNum; i++ {
 		endPos := endReadPos
+		beginPos := readPos
 		if i != endFileNum {
 			endPos = -1
 		}
-		depth += d.depthInFile(i, readPos, endPos)
+		if i != readFileNum {
+			beginPos = 0
+		}
+		depth += d.depthInFile(i, beginPos, endPos)
+		// d.logf(INFO, "depthInFile(%d): readFileNum=%d, readPos=%d, endPos=%d", depth, i, beginPos, endPos)
 	}
 	return
 }
@@ -871,8 +878,12 @@ func (d *diskQueue) depthInFile(readFileNum, readPos, endPos int64) (depth int64
 	if err != nil {
 		return
 	}
+	// d.logf(INFO, "DISKQUEUE(%s): depthInFile.openFile() opened %s", d.name, d.fileName(readFileNum))
 	defer readFile.Close()
 	for {
+		if -1 != endPos && endPos-readPos < 4 {
+			return
+		}
 		err = binary.Read(reader, binary.BigEndian, &msgSize)
 		if err != nil {
 			return
@@ -882,9 +893,9 @@ func (d *diskQueue) depthInFile(readFileNum, readPos, endPos int64) (depth int64
 			return
 		}
 
+		// this file is corrupt and we have no reasonable guarantee on
+		// where a new message should begin
 		if msgSize < d.minMsgSize || msgSize > d.maxMsgSize {
-			// this file is corrupt and we have no reasonable guarantee on
-			// where a new message should begin
 			return
 		}
 		discarded, err := reader.Discard(int(msgSize))
@@ -893,9 +904,6 @@ func (d *diskQueue) depthInFile(readFileNum, readPos, endPos int64) (depth int64
 		}
 		depth++
 		readPos += int64(msgSize)
-		if -1 != endPos && endPos-readPos < 4 {
-			return
-		}
 	}
 }
 
@@ -906,6 +914,7 @@ func (d *diskQueue) fastForwardInFile(f func([]byte) int, buf []byte, readFileNu
 	if err != nil {
 		return
 	}
+	// d.logf(INFO, "DISKQUEUE(%s): fastForwardInFile.openFile() opened %s", d.name, d.fileName(currReadFileNum))
 	defer readFile.Close()
 	for {
 		dataRead, err := d.peekOne(readFile, reader, buf, currReadFileNum, currReadPos)
@@ -929,8 +938,6 @@ func (d *diskQueue) openFile(readFileNum, readPos int64) (readFile *os.File, rea
 		readFile = nil
 		return readFile, reader, err
 	}
-
-	d.logf(INFO, "DISKQUEUE(%s): readOne() opened %s", d.name, curFileName)
 
 	if readPos > 0 {
 		_, err = readFile.Seek(readPos, 0)
@@ -962,9 +969,9 @@ func (d *diskQueue) peekOne(readFile *os.File, reader *bufio.Reader, buf []byte,
 		return nil, err
 	}
 
+	// this file is corrupt and we have no reasonable guarantee on
+	// where a new message should begin
 	if msgSize < d.minMsgSize || msgSize > d.maxMsgSize {
-		// this file is corrupt and we have no reasonable guarantee on
-		// where a new message should begin
 		return nil, fmt.Errorf("invalid message read size (%d)", msgSize)
 	}
 

@@ -680,17 +680,17 @@ func (suite *FastForwardTestSuite) SetupTest() {
 	}
 	suite.tmpDir = tmpDir
 	maxFileSize := (suite.MessageSize+4)*suite.MessagePreFile - 1
-	dq := New(dqName, tmpDir, int64(maxFileSize), 0, 1<<10, 2500, 2*time.Second, l)
-	suite.dq = dq
-	suite.Assert().NotNil(dq)
-	suite.Assert().Equal(int64(0), dq.Depth())
+	d := New(dqName, tmpDir, int64(maxFileSize), 0, 1<<10, 2500, time.Second, l)
+	suite.dq = d
+	suite.Assert().NotNil(d)
+	suite.Assert().Equal(int64(0), d.Depth())
 	t.Log("diskqueue created")
 
 	{
 		for i := 0; i < suite.WrittenMsgNum; i++ {
-			err := dq.Put(testEncodeMessage(i)[:suite.MessageSize])
+			err := d.Put(testEncodeMessage(i)[:suite.MessageSize])
 			suite.Assert().Nil(err)
-			suite.Assert().Equal(int64(i+1), dq.Depth())
+			suite.Assert().Equal(int64(i+1), d.Depth())
 
 			t.Logf("inserted %d messages", i)
 		}
@@ -706,17 +706,17 @@ func (suite *FastForwardTestSuite) SetupTest() {
 				// failed
 				suite.Assert().FailNowf("drain message failed", "expected to drain %d messages", suite.ReadMsgNum)
 				break TimerLoop
-			case msg := <-dq.ReadChan():
+			case msg := <-d.ReadChan():
 				realIdx := testDecodeMessage(msg)
-				dq.BufferPoolPut(msg)
+				d.BufferPoolPut(msg)
 				t.Logf("drained %d : %d messages before test", i+1, realIdx)
 			}
 		}
 	}
 
 	suite.Assert().Eventuallyf(func() bool {
-		return dq.Depth() == int64(suite.WrittenMsgNum-suite.ReadMsgNum)
-	}, 2*time.Second, 10*time.Millisecond, "depth should equal to %d, we got %d", suite.WrittenMsgNum-suite.ReadMsgNum, dq.Depth())
+		return d.Depth() == int64(suite.WrittenMsgNum-suite.ReadMsgNum)
+	}, 2*time.Second, 10*time.Millisecond, "depth should equal to %d, we got %d", suite.WrittenMsgNum-suite.ReadMsgNum, d.Depth())
 }
 
 func (suite *FastForwardTestSuite) TearDownTest() {
@@ -778,11 +778,32 @@ func (suite *FastForwardTestSuite) TestFastForward() {
 
 		t.Logf("try to get a message, it should be %d", suite.ExpectedMsgIndex)
 
-		suite.Assert().Eventuallyf(func() bool {
-			msg := <-suite.dq.ReadChan()
-			index := testDecodeMessage(msg)
-			return index == suite.ExpectedMsgIndex
-		}, time.Second, 50*time.Millisecond, "we should get message #%d", suite.ExpectedMsgIndex)
+		{
+			timer := time.NewTimer(time.Second)
+			defer timer.Stop()
+		TimerLoop:
+			for i := 0; i < suite.ReadMsgNum; i++ {
+				select {
+				case <-timer.C:
+					// failed
+					suite.Assert().FailNowf("drain message failed", "we should get message #%d, but we got nothing", suite.ExpectedMsgIndex)
+					break TimerLoop
+				case msg := <-d.ReadChan():
+					realIdx := testDecodeMessage(msg)
+					d.BufferPoolPut(msg)
+					if realIdx == suite.ExpectedMsgIndex {
+					} else {
+						suite.Assert().FailNowf("drain message failed", "we should get message #%d, not #%d", suite.ExpectedMsgIndex, realIdx)
+					}
+					break TimerLoop
+				}
+			}
+		}
+		// suite.Assert().Eventuallyf(func() bool {
+		// 	msg := <-suite.dq.ReadChan()
+		// 	index := testDecodeMessage(msg)
+		// 	return index == suite.ExpectedMsgIndex
+		// }, time.Second, 50*time.Millisecond, "we should get message #%d", suite.ExpectedMsgIndex)
 	}
 }
 
@@ -795,12 +816,12 @@ func TestFastForward1(t *testing.T) {
 	}{
 		{WrittenMsgNum: 0, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
 		{WrittenMsgNum: 0, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 1, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
-		{WrittenMsgNum: 1, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 1, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 1, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		// //
+		// {WrittenMsgNum: 1, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+		// {WrittenMsgNum: 1, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		// //
+		// {WrittenMsgNum: 1, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		// {WrittenMsgNum: 1, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
 	}
 	for _, v := range testTable {
 		suite.Run(t, &FastForwardTestSuite{
@@ -813,222 +834,258 @@ func TestFastForward1(t *testing.T) {
 	// readpos == writepos
 }
 
-func TestFastForward2a(t *testing.T) {
-	// readnum + 1 == writenum
-	// readpos < writepos
-	testTable := []struct {
-		WrittenMsgNum    int
-		ReadMsgNum       int
-		TargetMsgIndex   int
-		ExpectedMsgIndex int
-	}{
-		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
-		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
-	}
-	for _, v := range testTable {
-		suite.Run(t, &FastForwardTestSuite{
-			MessageSize: 4, MessagePreFile: 2,
-			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
-			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
-		})
-	}
-}
+// func TestFastForward2a(t *testing.T) {
+// 	// readnum + 1 == writenum
+// 	// readpos < writepos
+// 	testTable := []struct {
+// 		WrittenMsgNum    int
+// 		ReadMsgNum       int
+// 		TargetMsgIndex   int
+// 		ExpectedMsgIndex int
+// 	}{
+// 		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+// 		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+// 	}
+// 	for _, v := range testTable {
+// 		suite.Run(t, &FastForwardTestSuite{
+// 			MessageSize: 4, MessagePreFile: 2,
+// 			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+// 			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+// 		})
+// 	}
+// }
 
-func TestFastForward2b(t *testing.T) {
-	// readnum + 1 == writenum
-	// readpos < writepos
-	testTable := []struct {
-		WrittenMsgNum    int
-		ReadMsgNum       int
-		TargetMsgIndex   int
-		ExpectedMsgIndex int
-	}{
-		//
-		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
-		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
-	}
-	for _, v := range testTable {
-		suite.Run(t, &FastForwardTestSuite{
-			MessageSize: 4, MessagePreFile: 2,
-			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
-			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
-		})
-	}
-}
+// func TestFastForward2b(t *testing.T) {
+// 	// readnum + 1 == writenum
+// 	// readpos < writepos
+// 	testTable := []struct {
+// 		WrittenMsgNum    int
+// 		ReadMsgNum       int
+// 		TargetMsgIndex   int
+// 		ExpectedMsgIndex int
+// 	}{
+// 		//
+// 		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+// 	}
+// 	for _, v := range testTable {
+// 		suite.Run(t, &FastForwardTestSuite{
+// 			MessageSize: 4, MessagePreFile: 2,
+// 			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+// 			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+// 		})
+// 	}
+// }
 
-func TestFastForward3a(t *testing.T) {
-	// readnum + 2 == writenum
-	testTable := []struct {
-		WrittenMsgNum    int
-		ReadMsgNum       int
-		TargetMsgIndex   int
-		ExpectedMsgIndex int
-	}{
-		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
-		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
-	}
-	for _, v := range testTable {
-		suite.Run(t, &FastForwardTestSuite{
-			MessageSize: 4, MessagePreFile: 2,
-			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
-			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
-		})
-	}
-}
+// func TestFastForward3a(t *testing.T) {
+// 	// readnum + 2 == writenum
+// 	testTable := []struct {
+// 		WrittenMsgNum    int
+// 		ReadMsgNum       int
+// 		TargetMsgIndex   int
+// 		ExpectedMsgIndex int
+// 	}{
+// 		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+// 	}
+// 	for _, v := range testTable {
+// 		suite.Run(t, &FastForwardTestSuite{
+// 			MessageSize: 4, MessagePreFile: 2,
+// 			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+// 			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+// 		})
+// 	}
+// }
 
-func TestFastForward3b(t *testing.T) {
-	// readnum + 2 == writenum
-	testTable := []struct {
-		WrittenMsgNum    int
-		ReadMsgNum       int
-		TargetMsgIndex   int
-		ExpectedMsgIndex int
-	}{
-		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
-		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
-		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
-		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
-		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 0, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 1, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 2, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 3, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
-		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
-		//
-		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
-		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
-	}
-	for _, v := range testTable {
-		suite.Run(t, &FastForwardTestSuite{
-			MessageSize: 4, MessagePreFile: 2,
-			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
-			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
-		})
-	}
-	// readnum + 2 == writenum
-	// readpos > writepos
-	// target in readnum
-}
+// func TestFastForward3b(t *testing.T) {
+// 	// readnum + 2 == writenum
+// 	testTable := []struct {
+// 		WrittenMsgNum    int
+// 		ReadMsgNum       int
+// 		TargetMsgIndex   int
+// 		ExpectedMsgIndex int
+// 	}{
+// 		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 0, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 1, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 2, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 3, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+// 		//
+// 		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+// 		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+// 	}
+// 	for _, v := range testTable {
+// 		suite.Run(t, &FastForwardTestSuite{
+// 			MessageSize: 4, MessagePreFile: 2,
+// 			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+// 			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+// 		})
+// 	}
+// 	// readnum + 2 == writenum
+// 	// readpos > writepos
+// 	// target in readnum
+// }
 
-func TestFastForward4(t *testing.T) {
-	// readnum + 3 == writenum
-	// readpos > writepos
-	// target in readnum
-	for i := 6; i < 13; i++ {
-		for j := 0; j <= 2; j++ {
-			for k := 0; k <= i; k++ {
-				expectedMsgIndex := 0
-				if j > expectedMsgIndex {
-					expectedMsgIndex = j
-				}
-				if k > expectedMsgIndex {
-					expectedMsgIndex = k
-				}
-				if i <= expectedMsgIndex {
-					expectedMsgIndex = -1
-				}
+// func TestFastForward4(t *testing.T) {
+// 	// readnum + 3 == writenum
+// 	// readpos > writepos
+// 	// target in readnum
+// 	// for i := 6; i < 13; i++ {
+// 	for i := 6; i < 8; i++ {
+// 		for j := 0; j <= 2; j++ {
+// 			for k := 0; k <= i; k++ {
+// 				expectedMsgIndex := 0
+// 				if j > expectedMsgIndex {
+// 					expectedMsgIndex = j
+// 				}
+// 				if k > expectedMsgIndex {
+// 					expectedMsgIndex = k
+// 				}
+// 				if i <= expectedMsgIndex {
+// 					expectedMsgIndex = -1
+// 				}
 
-				suite.Run(t, &FastForwardTestSuite{
-					MessageSize: 4, MessagePreFile: 2,
-					WrittenMsgNum: i, ReadMsgNum: j,
-					TargetMsgIndex: k, ExpectedMsgIndex: expectedMsgIndex,
-				})
-			}
-		}
-	}
-	// target in readnum+1
-	// target in writenum
-}
+// 				suite.Run(t, &FastForwardTestSuite{
+// 					MessageSize: 4, MessagePreFile: 2,
+// 					WrittenMsgNum: i, ReadMsgNum: j,
+// 					TargetMsgIndex: k, ExpectedMsgIndex: expectedMsgIndex,
+// 				})
+// 			}
+// 		}
+// 	}
+// 	// target in readnum+1
+// 	// target in writenum
+// }
 
-func TestFastForward5(t *testing.T) {
+// func TestFastForward5(t *testing.T) {
+// 	// readnum + 4 == writenum
+// 	// readpos > writepos
+// 	// target in readnum
+// 	// target in readnum+1
+// 	// target in readnum+2
+// 	// target in writenum
+// 	// for i := 15; i < 22; i++ {
+// 	for i := 15; i < 18; i++ {
+// 		// for i := 15; i < 16; i++ {
+// 		for j := 0; j <= 2; j++ {
+// 			for k := 0; k <= i; k++ {
+// 				expectedMsgIndex := 0
+// 				if j > expectedMsgIndex {
+// 					expectedMsgIndex = j
+// 				}
+// 				if k > expectedMsgIndex {
+// 					expectedMsgIndex = k
+// 				}
+// 				if i <= expectedMsgIndex {
+// 					expectedMsgIndex = -1
+// 				}
+
+// 				suite.Run(t, &FastForwardTestSuite{
+// 					MessageSize: 4, MessagePreFile: 3,
+// 					WrittenMsgNum: i, ReadMsgNum: j,
+// 					TargetMsgIndex: k, ExpectedMsgIndex: expectedMsgIndex,
+// 				})
+// 			}
+// 		}
+// 	}
+// }
+
+func TestFastForward6(t *testing.T) {
 	// readnum + 4 == writenum
 	// readpos > writepos
 	// target in readnum
 	// target in readnum+1
 	// target in readnum+2
 	// target in writenum
-	for i := 15; i < 22; i++ {
+	// for i := 15; i < 22; i++ {
+	for i := 7; i < 10; i++ {
+		// for i := 4; i < 9; i++ {
 		for j := 0; j <= 2; j++ {
 			for k := 0; k <= i; k++ {
 				expectedMsgIndex := 0

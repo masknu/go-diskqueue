@@ -3,8 +3,10 @@ package diskqueue
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/suite"
 )
 
 func Equal(t *testing.T, expected, actual interface{}) {
@@ -613,5 +617,437 @@ func benchmarkDiskQueueGet(size int64, b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		<-dq.ReadChan()
+	}
+}
+
+func TestDiskQueueBufferPut(t *testing.T) {
+	l := NewTestLogger(t)
+
+	dqName := "test_disk_queue_buffer_put" + strconv.Itoa(int(time.Now().Unix()))
+	tmpDir, err := ioutil.TempDir("", fmt.Sprintf("nsq-test-%d", time.Now().UnixNano()))
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	dq := New(dqName, tmpDir, 1024, 4, 1<<10, 2500, 2*time.Second, l)
+	defer dq.Close()
+	NotNil(t, dq)
+	Equal(t, int64(0), dq.Depth())
+
+	// shouldn't enter the pool
+	var msg [1<<10 + 1]byte
+	dq.BufferPoolPut(msg[:])
+}
+
+func testEncodeMessage(index int) []byte {
+	var msg [1024]byte
+	binary.LittleEndian.PutUint32(msg[:4], uint32(index))
+	return msg[:]
+}
+
+func testDecodeMessage(msg []byte) (index int) {
+	return int(binary.LittleEndian.Uint32(msg[:4]))
+}
+
+type FastForwardTestSuite struct {
+	suite.Suite
+	MessageSize      int
+	MessagePreFile   int
+	WrittenMsgNum    int
+	ReadMsgNum       int
+	TargetMsgIndex   int
+	ExpectedMsgIndex int
+	tmpDir           string
+	dq               Interface
+}
+
+func (suite *FastForwardTestSuite) SetupTest() {
+	t := suite.T()
+
+	t.Logf("start FastForwardTestSuite, args: "+
+		"MessageSize:%d,MessagePreFile:%d, "+
+		"WrittenMsgNum:%d,ReadMsgNum:%d, "+
+		"TargetMsgIndex:%d,ExpectedMsgIndex:%d",
+		suite.MessageSize, suite.MessagePreFile,
+		suite.WrittenMsgNum, suite.ReadMsgNum,
+		suite.TargetMsgIndex, suite.ExpectedMsgIndex)
+
+	l := NewTestLogger(t)
+	dqName := url.PathEscape(t.Name()) + strconv.Itoa(int(time.Now().Unix()))
+	tmpDir, err := ioutil.TempDir("", fmt.Sprintf("nsq-test-%d", time.Now().UnixNano()))
+	if err != nil {
+		suite.Assert().FailNowf("create tempdir failed", "err: %d", err)
+	}
+	suite.tmpDir = tmpDir
+	maxFileSize := (suite.MessageSize+4)*suite.MessagePreFile - 1
+	dq := New(dqName, tmpDir, int64(maxFileSize), 0, 1<<10, 2500, 2*time.Second, l)
+	suite.dq = dq
+	suite.Assert().NotNil(dq)
+	suite.Assert().Equal(int64(0), dq.Depth())
+	t.Log("diskqueue created")
+
+	{
+		for i := 0; i < suite.WrittenMsgNum; i++ {
+			err := dq.Put(testEncodeMessage(i)[:suite.MessageSize])
+			suite.Assert().Nil(err)
+			suite.Assert().Equal(int64(i+1), dq.Depth())
+
+			t.Logf("inserted %d messages", i)
+		}
+	}
+
+	{
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+	TimerLoop:
+		for i := 0; i < suite.ReadMsgNum; i++ {
+			select {
+			case <-timer.C:
+				// failed
+				suite.Assert().FailNowf("drain message failed", "expected to drain %d messages", suite.ReadMsgNum)
+				break TimerLoop
+			case msg := <-dq.ReadChan():
+				realIdx := testDecodeMessage(msg)
+				dq.BufferPoolPut(msg)
+				t.Logf("drained %d : %d messages before test", i+1, realIdx)
+			}
+		}
+	}
+
+	suite.Assert().Eventuallyf(func() bool {
+		return dq.Depth() == int64(suite.WrittenMsgNum-suite.ReadMsgNum)
+	}, 2*time.Second, 10*time.Millisecond, "depth should equal to %d, we got %d", suite.WrittenMsgNum-suite.ReadMsgNum, dq.Depth())
+}
+
+func (suite *FastForwardTestSuite) TearDownTest() {
+	if suite.dq != nil {
+		suite.dq.Close()
+	}
+	if suite.tmpDir != "" {
+		os.RemoveAll(suite.tmpDir)
+	}
+}
+
+// func (suite *FastForwardTestSuite) TestPutAInvalidMessage() {
+// 	suite.dq.BufferPoolPut(msg)
+// }
+
+// All methods that begin with "Test" are run as tests within a
+// suite.
+func (suite *FastForwardTestSuite) TestFastForward() {
+	t := suite.T()
+
+	err := suite.dq.FastForward(func(msg []byte) int {
+		index := testDecodeMessage(msg)
+		if index < suite.TargetMsgIndex {
+			return 1
+		}
+		return 0
+	})
+	t.Logf("FastForward to %d message", suite.TargetMsgIndex)
+	suite.Assert().NoError(err)
+
+	if suite.ExpectedMsgIndex == -1 {
+		timer := time.NewTimer(10 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			// succeeded
+		case msg := <-suite.dq.ReadChan():
+			suite.dq.BufferPoolPut(msg)
+			// we weren't expecting this
+			suite.Assert().Fail("we shouldn't get any message from the queue")
+		}
+	} else {
+		// check files, any files before ExpectedMsgIndex shouldn't exist
+		expectedFileNum := suite.ExpectedMsgIndex / suite.MessagePreFile
+		endFileNum := (suite.WrittenMsgNum + suite.MessagePreFile - 1) / suite.MessagePreFile
+
+		t.Logf("check files, expectedFileNum: %d, endFileNum: %d", expectedFileNum, endFileNum)
+
+		d := suite.dq.(*diskQueue)
+		for i := 0; i < endFileNum; i++ {
+			path := d.fileName(int64(i))
+			if i < expectedFileNum {
+				_, err := os.Lstat(path)
+				suite.Assert().Errorf(err, "file shouldn't exist, filename: %s", path)
+			} else {
+				suite.Assert().FileExists(path)
+			}
+		}
+
+		t.Logf("try to get a message, it should be %d", suite.ExpectedMsgIndex)
+
+		suite.Assert().Eventuallyf(func() bool {
+			msg := <-suite.dq.ReadChan()
+			index := testDecodeMessage(msg)
+			return index == suite.ExpectedMsgIndex
+		}, time.Second, 50*time.Millisecond, "we should get message #%d", suite.ExpectedMsgIndex)
+	}
+}
+
+func TestFastForward1(t *testing.T) {
+	testTable := []struct {
+		WrittenMsgNum    int
+		ReadMsgNum       int
+		TargetMsgIndex   int
+		ExpectedMsgIndex int
+	}{
+		{WrittenMsgNum: 0, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 0, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 1, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+		{WrittenMsgNum: 1, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 1, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 1, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+	}
+	for _, v := range testTable {
+		suite.Run(t, &FastForwardTestSuite{
+			MessageSize: 4, MessagePreFile: 2,
+			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+		})
+	}
+	// readnum == writenum
+	// readpos == writepos
+}
+
+func TestFastForward2a(t *testing.T) {
+	// readnum + 1 == writenum
+	// readpos < writepos
+	testTable := []struct {
+		WrittenMsgNum    int
+		ReadMsgNum       int
+		TargetMsgIndex   int
+		ExpectedMsgIndex int
+	}{
+		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 2, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 2, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 2, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+	}
+	for _, v := range testTable {
+		suite.Run(t, &FastForwardTestSuite{
+			MessageSize: 4, MessagePreFile: 2,
+			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+		})
+	}
+}
+
+func TestFastForward2b(t *testing.T) {
+	// readnum + 1 == writenum
+	// readpos < writepos
+	testTable := []struct {
+		WrittenMsgNum    int
+		ReadMsgNum       int
+		TargetMsgIndex   int
+		ExpectedMsgIndex int
+	}{
+		//
+		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 3, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 3, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 3, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 3, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+	}
+	for _, v := range testTable {
+		suite.Run(t, &FastForwardTestSuite{
+			MessageSize: 4, MessagePreFile: 2,
+			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+		})
+	}
+}
+
+func TestFastForward3a(t *testing.T) {
+	// readnum + 2 == writenum
+	testTable := []struct {
+		WrittenMsgNum    int
+		ReadMsgNum       int
+		TargetMsgIndex   int
+		ExpectedMsgIndex int
+	}{
+		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 0, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 1, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 2, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 4, ReadMsgNum: 3, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 4, ReadMsgNum: 4, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+	}
+	for _, v := range testTable {
+		suite.Run(t, &FastForwardTestSuite{
+			MessageSize: 4, MessagePreFile: 2,
+			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+		})
+	}
+}
+
+func TestFastForward3b(t *testing.T) {
+	// readnum + 2 == writenum
+	testTable := []struct {
+		WrittenMsgNum    int
+		ReadMsgNum       int
+		TargetMsgIndex   int
+		ExpectedMsgIndex int
+	}{
+		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 0, ExpectedMsgIndex: 0},
+		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 0, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 0, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 1, ExpectedMsgIndex: 1},
+		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 1, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 0, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 1, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 2, ExpectedMsgIndex: 2},
+		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 2, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 0, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 1, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 2, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 3, ExpectedMsgIndex: 3},
+		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 3, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 0, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 1, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 2, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 3, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 4, ExpectedMsgIndex: 4},
+		{WrittenMsgNum: 5, ReadMsgNum: 4, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+		//
+		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 0, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 1, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 2, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 3, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 4, ExpectedMsgIndex: -1},
+		{WrittenMsgNum: 5, ReadMsgNum: 5, TargetMsgIndex: 5, ExpectedMsgIndex: -1},
+	}
+	for _, v := range testTable {
+		suite.Run(t, &FastForwardTestSuite{
+			MessageSize: 4, MessagePreFile: 2,
+			WrittenMsgNum: v.WrittenMsgNum, ReadMsgNum: v.ReadMsgNum,
+			TargetMsgIndex: v.TargetMsgIndex, ExpectedMsgIndex: v.ExpectedMsgIndex,
+		})
+	}
+	// readnum + 2 == writenum
+	// readpos > writepos
+	// target in readnum
+}
+
+func TestFastForward4(t *testing.T) {
+	// readnum + 3 == writenum
+	// readpos > writepos
+	// target in readnum
+	for i := 6; i < 13; i++ {
+		for j := 0; j <= 2; j++ {
+			for k := 0; k <= i; k++ {
+				expectedMsgIndex := 0
+				if j > expectedMsgIndex {
+					expectedMsgIndex = j
+				}
+				if k > expectedMsgIndex {
+					expectedMsgIndex = k
+				}
+				if i <= expectedMsgIndex {
+					expectedMsgIndex = -1
+				}
+
+				suite.Run(t, &FastForwardTestSuite{
+					MessageSize: 4, MessagePreFile: 2,
+					WrittenMsgNum: i, ReadMsgNum: j,
+					TargetMsgIndex: k, ExpectedMsgIndex: expectedMsgIndex,
+				})
+			}
+		}
+	}
+	// target in readnum+1
+	// target in writenum
+}
+
+func TestFastForward5(t *testing.T) {
+	// readnum + 4 == writenum
+	// readpos > writepos
+	// target in readnum
+	// target in readnum+1
+	// target in readnum+2
+	// target in writenum
+	for i := 15; i < 22; i++ {
+		for j := 0; j <= 2; j++ {
+			for k := 0; k <= i; k++ {
+				expectedMsgIndex := 0
+				if j > expectedMsgIndex {
+					expectedMsgIndex = j
+				}
+				if k > expectedMsgIndex {
+					expectedMsgIndex = k
+				}
+				if i <= expectedMsgIndex {
+					expectedMsgIndex = -1
+				}
+
+				suite.Run(t, &FastForwardTestSuite{
+					MessageSize: 4, MessagePreFile: 3,
+					WrittenMsgNum: i, ReadMsgNum: j,
+					TargetMsgIndex: k, ExpectedMsgIndex: expectedMsgIndex,
+				})
+			}
+		}
 	}
 }

@@ -709,6 +709,9 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 	var err error
 	oldDataRead := dataRead
 
+	if d.writeFile != nil {
+		d.sync()
+	}
 	// data is current data and ready to send over the channel
 	if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {
 		// start from d.nextReadFileNum, d.nextReadPos, dataRead
@@ -726,13 +729,13 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 				return err
 			}
 		}
+		// continue to seek
+		if len(dataRead) == 0 {
+			return err
+		}
 		for {
-			if len(dataRead) == 0 {
-				// continue to seek
-				break
-			}
 			// stop forward
-			if f(dataRead) == 0 {
+			if len(dataRead) == 0 || f(dataRead) == 0 {
 				endWriteFileNum, endWritePos = currReadFileNum, currReadPos
 				lastStopReadFileNum, lastStopReadPos = currReadFileNum, currReadPos
 				// do we have data to backward half?
@@ -740,10 +743,16 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 					// backward half
 					currReadFileNum = beginReadFileNum + (currReadFileNum-beginReadFileNum)/2
 					if currReadFileNum == beginReadFileNum {
+						var stopped bool
 						currReadPos = beginReadPos
+						tempLastStopReadPos := lastStopReadPos
 						// search this file to the end
-						lastStopReadPos = d.fastForwardInFile(f, buf, currReadFileNum, currReadPos)
-						currReadPos = lastStopReadPos
+						tempLastStopReadPos, stopped = d.fastForwardInFile(f, buf, currReadFileNum, currReadPos)
+						currReadPos = tempLastStopReadPos
+						if stopped {
+							lastStopReadFileNum = currReadFileNum
+							lastStopReadPos = tempLastStopReadPos
+						}
 						break
 					} else {
 						currReadPos = 0
@@ -771,14 +780,24 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 					currReadPos = 0
 					dataRead, err = d.peekOne(nil, nil, buf, currReadFileNum, currReadPos)
 					if err != nil {
-						break
+						// treat this as backward signal
+						if currReadFileNum == d.writeFileNum && d.writePos == 0 {
+							err = nil
+						} else {
+							break
+						}
 					}
 				} else if currReadFileNum == endWriteFileNum {
 					if currReadPos < endWritePos {
-						lastStopReadFileNum = currReadFileNum
+						tempLastStopReadPos := lastStopReadPos
 						// search from currReadPos to endWritePos or the end of file
-						lastStopReadPos = d.fastForwardInFile(f, buf, currReadFileNum, currReadPos)
-						currReadPos = lastStopReadPos
+						tempLastStopReadPos, _ = d.fastForwardInFile(f, buf, currReadFileNum, currReadPos)
+						currReadPos = tempLastStopReadPos
+						// igonre stopped
+						// if stopped {
+						lastStopReadFileNum = currReadFileNum
+						lastStopReadPos = tempLastStopReadPos
+						// }
 						break
 					} else {
 						// this is the end
@@ -795,14 +814,10 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 			// reclaim oldDataRead
 			d.BufferPoolPut(oldDataRead)
 			if d.readFileNum != lastStopReadFileNum {
-				// TODO: remove all file from d.readFileNum to lastStopReadFileNum
+				// remove all file from d.readFileNum to lastStopReadFileNum
 				if d.readFile != nil {
 					d.readFile.Close()
 					d.readFile = nil
-				}
-
-				if d.writeFile != nil {
-					d.sync()
 				}
 
 				d.removeFiles(d.readFileNum, lastStopReadFileNum)
@@ -812,6 +827,7 @@ func (d *diskQueue) fastForward(dataRead []byte, f func([]byte) int) error {
 			}
 			d.readFileNum, d.readPos = lastStopReadFileNum, lastStopReadPos
 			d.nextReadFileNum, d.nextReadPos = d.readFileNum, d.readPos
+			d.sync()
 		} else {
 			// we didn't move our position
 		}
@@ -883,7 +899,7 @@ func (d *diskQueue) depthInFile(readFileNum, readPos, endPos int64) (depth int64
 	}
 }
 
-func (d *diskQueue) fastForwardInFile(f func([]byte) int, buf []byte, readFileNum, readPos int64) (lastStopReadPos int64) {
+func (d *diskQueue) fastForwardInFile(f func([]byte) int, buf []byte, readFileNum, readPos int64) (lastStopReadPos int64, stopped bool) {
 	currReadPos := readPos
 	currReadFileNum := readFileNum
 	readFile, reader, err := d.openFile(currReadFileNum, currReadPos)
@@ -897,6 +913,7 @@ func (d *diskQueue) fastForwardInFile(f func([]byte) int, buf []byte, readFileNu
 			return
 		}
 		if f(dataRead) == 0 {
+			stopped = true
 			return
 		} else {
 			currReadPos += int64(4 + len(dataRead))
